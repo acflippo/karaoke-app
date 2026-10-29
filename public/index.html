@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local Band Karaoke Queue</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    /* Display view scales with the window: every Tailwind size (text, padding, QR codes, bars)
+       is based on this root font size. 16px on a 1440x900 laptop window; ~25px on a full-screen
+       27-30" 2560x1440 monitor. Lower 90 / 56 = everything bigger; raise them = smaller. */
+    html.display-mode {
+      font-size: clamp(12px, min(100vw / 90, 100vh / 56), 48px);
+    }
+    /* Ticker: padding-left (100% of the ticker bar's width) starts the text just off the
+       right edge, so it appears right away no matter how long the queue text is */
+    @keyframes marquee {
+      0% { transform: translateX(0); }
+      100% { transform: translateX(-100%); }
+    }
+    .animate-marquee {
+      display: inline-block;
+      white-space: nowrap;
+      padding-left: 100%;
+      animation: marquee 45s linear infinite;
+      animation-delay: 0s; /* pause before the ticker first starts, e.g. 2s */
+    }
+    /* Fireworks overlay: "screen" blending drops the video's black background */
+    #fireworks {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      mix-blend-mode: screen;
+      /* The video's background is dark gray, not black; contrast pushes it to pure black
+         so "screen" blending doesn't wash out the display */
+      filter: contrast(1.5);
+      pointer-events: none;
+      z-index: 1; /* behind the cards and text (z-10), so they never get lighter */
+      opacity: 0;
+      transition: opacity 0.8s ease;
+    }
+    #fireworks.show { opacity: 1; }
+    /* Ambient fireworks loop behind the display content */
+    #fireworks-bg {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      mix-blend-mode: screen;
+      filter: contrast(1.5); /* gray video background -> black, see #fireworks */
+      pointer-events: none;
+      z-index: 0;
+      opacity: 0.65;
+    }
+    /* 4-bar music level animation next to the current song */
+    .eq-bar {
+      transform-box: fill-box;
+      transform-origin: bottom;
+      /* linear + many quick jumps = snappy, jittery levels instead of a smooth glide */
+      animation: sound-wave 0.5s linear infinite;
+    }
+    /* Different speeds and negative delays keep the bars out of sync from the first frame */
+    .eq-bar-1 { animation-duration: 1.20s; animation-delay: -0.1s; }
+    .eq-bar-2 { animation-duration: 1.30s; animation-delay: -0.3s; }
+    .eq-bar-3 { animation-duration: 1.15s;  animation-delay: -0.2s; }
+    .eq-bar-4 { animation-duration: 1.25s;  animation-delay: -0.45s; }
+    @keyframes sound-wave {
+      0%   { transform: scaleY(0.3); }
+      15%  { transform: scaleY(0.9); }
+      30%  { transform: scaleY(0.2); }
+      45%  { transform: scaleY(1.0); }
+      60%  { transform: scaleY(0.5); }
+      75%  { transform: scaleY(0.8); }
+      90%  { transform: scaleY(0.15); }
+      100% { transform: scaleY(0.3); }
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-white font-sans min-h-screen flex flex-col">
+
+  <script>
+    // Configuration URLs for QR Codes
+    const SONG_LIST_URL = "https://docs.google.com/spreadsheets/d/1G6BL5ardBrdVmFa7o0e_fMW2RMBk0iOYhu4e-Pi4Ltg/edit?usp=sharing";
+    const VENMO_URL = "https://venmo.com/u/AnnieFlippo";
+
+    const urlParams = new URLSearchParams(window.location.search);
+    const isDisplayView = urlParams.get('view') === 'display';
+    if (isDisplayView) document.documentElement.classList.add('display-mode');
+
+    document.addEventListener('DOMContentLoaded', () => {
+      // Extra large QR Codes
+      document.getElementById('qr-songs').src = `https://api.qrserver.com/v1/create-qr-code/?size=600x600&data=${encodeURIComponent(SONG_LIST_URL)}`;
+      document.getElementById('qr-venmo').src = `https://api.qrserver.com/v1/create-qr-code/?size=600x600&data=${encodeURIComponent(VENMO_URL)}`;
+
+      // Fireworks video speed: 1 = normal, 0.5 = half speed, 0.25 = very slow
+      const FIREWORKS_SPEED = 0.65;
+      ['fireworks-bg', 'fireworks'].forEach(id => {
+        const video = document.getElementById(id);
+        video.defaultPlaybackRate = FIREWORKS_SPEED;
+        video.playbackRate = FIREWORKS_SPEED;
+      });
+
+      // Background fireworks: pause between loops (in milliseconds; 0 = loop with no pause)
+      const FIREWORKS_PAUSE_MS = 0;
+      const fireworksBg = document.getElementById('fireworks-bg');
+      fireworksBg.addEventListener('ended', () => {
+        setTimeout(() => {
+          fireworksBg.currentTime = 0;
+          fireworksBg.play().catch(err => console.error("Background fireworks playback failed:", err));
+        }, FIREWORKS_PAUSE_MS);
+      });
+
+      if (isDisplayView) {
+        document.getElementById('admin-panel').classList.add('hidden');
+        document.getElementById('display-panel').classList.remove('hidden');
+      }
+
+      fetchQueue();
+      setInterval(fetchQueue, 3000);
+    });
+
+    async function fetchQueue() {
+      try {
+        const res = await fetch('/api/queue');
+        const data = await res.json();
+        renderQueue(data);
+      } catch (err) {
+        console.error("Error fetching queue:", err);
+      }
+    }
+
+    // Fireworks: play on the display screen whenever a new singer takes the stage
+    const FIREWORKS_DURATION_MS = 12000;
+    let lastCurrentId; // undefined until the first render, so a page load doesn't trigger fireworks
+    let fireworksTimer;
+
+    function playFireworks() {
+      const video = document.getElementById('fireworks');
+      clearTimeout(fireworksTimer);
+      video.currentTime = 0;
+      video.play().catch(err => console.error("Fireworks playback failed:", err));
+      video.classList.add('show');
+      fireworksTimer = setTimeout(() => {
+        video.classList.remove('show');
+        setTimeout(() => video.pause(), 1500); // pause after fade-out
+      }, FIREWORKS_DURATION_MS);
+    }
+
+    function renderQueue(data) {
+      const activeQueue = data.filter(item => item.status !== "Completed");
+      const current = activeQueue.find(item => item.status === "Current");
+      const waiting = activeQueue.filter(item => item.status === "Waiting");
+
+      if (isDisplayView) {
+        const currentId = current ? current.id : null;
+        if (lastCurrentId !== undefined && currentId && currentId !== lastCurrentId) {
+          playFireworks();
+        }
+        lastCurrentId = currentId;
+      }
+
+      // Display View Update (Horizontally Aligned)
+      if (current) {
+        document.getElementById('now-singer').innerText = current.singer;
+        document.getElementById('now-song').innerText = current.song;
+      } else {
+        document.getElementById('now-singer').innerText = "Stage Open!";
+        document.getElementById('now-song').innerText = "Add a song to get started";
+      }
+
+      // Ticker Update: Limit to max 6 upcoming singers, single "NEXT UP" label, no quotes
+      if (waiting.length > 0) {
+        const limitedWaiting = waiting.slice(0, 6);
+        const upcomingList = limitedWaiting.map((w, idx) => `#${idx + 1} ${w.singer} - ${w.song}`).join(" &nbsp;&nbsp;&nbsp;•&nbsp;&nbsp;&nbsp; ");
+        document.getElementById('ticker-content').innerHTML = `<strong>NEXT UP:</strong> &nbsp;&nbsp;&nbsp;•&nbsp;&nbsp;&nbsp; ${upcomingList}`;
+      } else {
+        document.getElementById('ticker-content').innerText = "Queue is clear — scan the QR code to request a song!";
+      }
+
+      // Admin Table Update
+      if (!isDisplayView) {
+        const queueList = document.getElementById('admin-queue-list');
+        queueList.innerHTML = '';
+        activeQueue.forEach((item) => {
+          const row = document.createElement('tr');
+          row.className = item.status === 'Current' ? 'bg-amber-500/20 text-amber-300 font-bold border-b border-slate-800' : 'border-b border-slate-800';
+          
+          let actionButtons = '<span class="text-xs text-slate-500">On Stage</span>';
+          if (item.status === 'Waiting') {
+            actionButtons = `
+              <button onclick="moveSinger('${item.id}', 'up')" title="Move up" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded mr-1 inline-flex items-center gap-1 text-sm align-middle">
+                <img src="/images/green_up_arrow.png" alt="" class="h-4 w-auto" /> Up
+              </button>
+              <button onclick="moveSinger('${item.id}', 'down')" title="Move down" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded inline-flex items-center gap-1 text-sm align-middle">
+                <img src="/images/red_down_arrow.png" alt="" class="h-4 w-auto" /> Down
+              </button>
+              <button onclick="removeSinger('${item.id}')" title="Remove from queue" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded ml-1 inline-flex items-center gap-1 text-sm align-middle">
+                <img src="/images/delete-button.png" alt="" class="h-4 w-auto" /> Remove
+              </button>
+            `;
+          }
+
+          // Order: current singer = 0, next up = 1, and so on (matches the "#1, #2" on the display ticker)
+          const order = item.status === 'Current' ? 0 : waiting.indexOf(item) + 1;
+
+          row.innerHTML = `
+            <td class="p-3 text-2xl font-black text-center">${order}</td>
+            <td class="p-3">${item.status === 'Current' ? '🎤 ON STAGE' : 'Waiting'}</td>
+            <td class="p-3">${item.singer}</td>
+            <td class="p-3">${item.song}</td>
+            <td class="p-3 text-slate-400 text-sm">${item.timestamp}</td>
+            <td class="p-3 text-right whitespace-nowrap">${actionButtons}</td>
+          `;
+          queueList.appendChild(row);
+        });
+      }
+    }
+
+    async function addSinger(e) {
+      e.preventDefault();
+      const singer = document.getElementById('singer-name').value;
+      const song = document.getElementById('song-title').value;
+      
+      await fetch('/api/queue/add', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ singer, song })
+      });
+
+      document.getElementById('singer-name').value = '';
+      document.getElementById('song-title').value = '';
+      fetchQueue();
+    }
+
+    async function nextSinger() {
+      await fetch('/api/queue/next', { method: 'POST' });
+      fetchQueue();
+    }
+
+    async function moveSinger(id, direction) {
+      await fetch('/api/queue/move', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id, direction })
+      });
+      fetchQueue();
+    }
+
+    async function removeSinger(id) {
+      if (!confirm('Remove this singer from the queue?')) return;
+      await fetch('/api/queue/remove', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id })
+      });
+      fetchQueue();
+    }
+  </script>
+
+  <!-- PUBLIC DISPLAY PANEL -->
+  <main id="display-panel" class="flex-1 flex flex-col justify-between p-6 relative overflow-hidden hidden">
+
+    <!-- Ambient fireworks background, always looping (muted so browsers allow autoplay) -->
+    <video id="fireworks-bg" src="/images/firework_loop.mov" muted autoplay playsinline preload="auto"></video>
+
+    <!-- Fireworks overlay for new singers (muted so browsers allow autoplay) -->
+    <video id="fireworks" src="/images/firework_loop.mov" muted loop playsinline preload="auto"></video>
+
+    <!-- Top Header -->
+    <header class="relative z-10 flex justify-between items-center text-white text-2xl tracking-widest uppercase font-semibold w-full px-2">
+      <!-- &#9835;&#xFE0E; = plain-text music note (unlike the 🎵 emoji, it takes the white text color) -->
+      <div>&#9835;&#xFE0E; Live Band Karaoke Night</div>
+      <!-- <a href="?view=admin" class="text-xs text-slate-600 hover:text-slate-400">Switch to Admin Mode</a> -->
+    </header>
+
+    <!-- Content Container -->
+    <div class="relative z-10 flex flex-col gap-6 my-auto max-w-7xl mx-auto w-full">
+      
+      <!-- 1. Current Singer & Song (Horizontally Aligned) -->
+      <div class="bg-slate-900/80 border border-slate-800 rounded-3xl p-6 backdrop-blur-md shadow-2xl flex flex-col items-center text-center">
+        <span class="inline-block px-8 py-3 bg-rose-500/20 text-rose-400 font-black rounded-full text-sm uppercase tracking-widest mb-3 animate-pulse border border-rose-500/30">
+          🎤 Now Performing
+        </span>
+        
+        <div class="flex flex-row items-center justify-center gap-4 w-full px-4 overflow-hidden">
+          <h1 id="now-singer" class="text-6xl xl:text-6xl leading-tight pb-2 font-black text-amber-400 truncate">Loading...</h1>
+          <span class="text-slate-600 text-5xl font-bold">•</span>
+          <h2 id="now-song" class="text-6xl xl:text-6xl leading-tight pb-2 font-normal text-slate-200 truncate">...</h2>
+          <!-- Music level bars (shrink-0 keeps them visible when a long song title truncates) -->
+          <svg class="h-12 w-auto shrink-0" viewBox="0 0 94 80" aria-hidden="true">
+            <rect class="eq-bar eq-bar-1" x="0"  y="0" width="16" height="80" rx="4" fill="#3B82F6" />
+            <rect class="eq-bar eq-bar-2" x="26" y="0" width="16" height="80" rx="4" fill="#10B981" />
+            <rect class="eq-bar eq-bar-3" x="52" y="0" width="16" height="80" rx="4" fill="#F59E0B" />
+            <rect class="eq-bar eq-bar-4" x="78" y="0" width="16" height="80" rx="4" fill="#EF4444" />
+          </svg>
+        </div>
+      </div>
+
+      <!-- 2. Two QR Codes taking up Left and Right halves -->
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-8 w-full">
+        
+        <!-- Song List QR (Left Half) -->
+        <div class="bg-[#3B82F6] text-slate-900 p-6 rounded-3xl flex flex-col items-center justify-center shadow-2xl">
+          <!-- QR code flanked by music images: notes tilted 20° left, treble clef tilted 45° right -->
+          <!-- 3 columns: [left space | QR | right space]; each image is centered in its side space,
+               so it sits halfway between the QR code and the edge of the blue box -->
+          <div class="grid grid-cols-[1fr_auto_1fr] items-center self-stretch -mx-6 mb-3">
+            <img src="/images/music_notes_stars.png" alt="" class="justify-self-center w-28 h-28 object-contain -rotate-[20deg] select-none" />
+            <img id="qr-songs" class="w-60 h-60 bg-white p-2 rounded-2xl" alt="Song List QR" />
+            <img src="/images/treble_clef.png" alt="" class="justify-self-center w-28 h-28 object-contain -rotate-[330deg] select-none" />
+          </div>
+          <span class="font-black text-3xl leading-tight uppercase tracking-wider text-center">Scan for Song List</span>
+        </div>
+
+        <!-- Tip Musician QR (Right Half) -->
+        <div class="bg-sky-500 text-white p-6 rounded-3xl flex flex-col items-center justify-center shadow-2xl">
+          <!-- Instruments around the QR corners (outside the code so it still scans):
+               saxophone top-left, guitar top-right, piano keys bottom-right -->
+          <!-- 3 columns stretched to the blue box edges: [left space | QR | right space].
+               Saxophone hugs the left edge, guitar hugs the right edge, piano stays next to the QR. -->
+          <div class="grid grid-cols-[1fr_auto_1fr] self-stretch -mx-6 mb-3">
+            <div class="relative">
+              <img src="/images/saxophone.png" alt="" class="absolute top-0 left-7 w-[7.0rem] h-[7.0rem] object-contain select-none" />
+              <img src="/images/drum_set.png" alt="" class="absolute bottom-0 left-7 w-[7.0rem] h-[7.0rem] object-contain -rotate-[350deg] select-none" />
+            </div>
+            <img id="qr-venmo" class="w-60 h-60 bg-white p-2 rounded-2xl" alt="Venmo QR" />
+            <div class="relative">
+              <img src="/images/guitar.png" alt="" class="absolute top-0 right-4 w-32 h-32 object-contain select-none" />
+              <img src="/images/piano_keys.png" alt="" class="absolute bottom-0 right-10 w-20 h-20 object-contain -rotate-[10deg] select-none" />
+            </div>
+          </div>
+          <span class="font-black text-3xl leading-tight uppercase tracking-wider text-center">Tip the Band via Venmo</span>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- Bottom Running Ticker -->
+    <footer class="relative z-10 w-full bg-slate-900 border-t border-slate-800 py-3 px-8 rounded-xl overflow-hidden shadow-inner mt-2">
+      <div class="w-full overflow-hidden">
+        <div id="ticker-content" class="animate-marquee text-5xl leading-tight pb-1 font-semibold text-emerald-400">
+          Loading upcoming singers...
+        </div>
+      </div>
+    </footer>
+  </main>
+
+  <!-- ADMIN / OPERATOR PANEL -->
+  <main id="admin-panel" class="flex-1 p-6 max-w-5xl mx-auto w-full">
+    <div class="flex justify-between items-center mb-6">
+      <h1 class="text-3xl font-bold text-amber-400">KJ Control Panel (Local)</h1>
+      <a href="?view=display" target="_blank" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-bold">
+        Open Public Display Screen ↗
+      </a>
+    </div>
+
+    <div class="bg-slate-900 p-6 rounded-xl border border-slate-800 mb-6">
+      <h2 class="text-xl font-semibold mb-4">Add Singer to Queue</h2>
+      <form onsubmit="addSinger(event)" class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <input type="text" id="singer-name" placeholder="Singer Name" required class="bg-slate-950 border border-slate-700 p-3 rounded-lg text-white" />
+        <input type="text" id="song-title" placeholder="Song Title & Artist" required class="bg-slate-950 border border-slate-700 p-3 rounded-lg text-white" />
+        <button type="submit" class="bg-emerald-600 hover:bg-emerald-500 font-bold p-3 rounded-lg transition">Add to Queue</button>
+      </form>
+    </div>
+
+    <div class="bg-slate-900 p-6 rounded-xl border border-slate-800">
+      <div class="flex justify-between items-center mb-4">
+        <h2 class="text-xl font-semibold">Active Queue</h2>
+        <button onclick="nextSinger()" class="bg-amber-500 hover:bg-amber-400 text-slate-950 font-black px-6 py-3 rounded-lg transition text-lg">
+          ⏭ Next Singer
+        </button>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="w-full text-left border-collapse">
+          <thead>
+            <tr class="border-b border-slate-700 text-slate-400 text-sm">
+              <th class="p-3 text-center">#</th>
+              <th class="p-3">Status</th>
+              <th class="p-3">Singer</th>
+              <th class="p-3">Song</th>
+              <th class="p-3">Time</th>
+              <th class="p-3 text-right">Reorder</th>
+            </tr>
+          </thead>
+          <tbody id="admin-queue-list"></tbody>
+        </table>
+      </div>
+    </div>
+  </main>
+
+</body>
+</html>

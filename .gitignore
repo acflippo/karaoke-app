@@ -1,0 +1,9 @@
+# Dependencies (rebuild with `npm install`)
+node_modules/
+
+# Live app data (current queue and performance history, not code)
+queue.json
+history.csv
+
+# macOS system files
+.DS_Store
