@@ -196,18 +196,52 @@
       goToLogin();
     }
 
-    // Sends an admin action; goes back to the login page if the session expired
+    // Sends an admin action and returns the server's reply (null if it failed);
+    // goes back to the login page if the session expired
     async function adminPost(url, body) {
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body || {})
       });
-      if (await signedOut(res)) return;
+      if (await signedOut(res)) return null;
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
         alert(data.error || 'Something went wrong. Please try again.');
+        return null;
       }
+      return data;
+    }
+
+    // Admin actions show on screen right away, then save to the sheet in the background.
+    // Saves run one at a time in click order, so quick clicks (Up, Up) don't overwrite each other.
+    let saveChain = Promise.resolve();
+    let pendingSaves = 0;
+    let lastSaveDone = 0;
+
+    // preview(queue) = the queue as it will look after this action (applied to a copy)
+    function saveAction(url, body, preview) {
+      renderQueue(preview(structuredClone(lastQueue)));
+      pendingSaves++;
+      saveChain = saveChain
+        .then(() => adminPost(url, body))
+        .catch(err => { console.error("Error saving:", err); return null; })
+        .then(data => {
+          pendingSaves--;
+          lastSaveDone = Date.now();
+          if (pendingSaves > 0) return; // a later click is still saving; its reply will update the screen
+          if (data && data.queue) renderQueue(data.queue);
+          else fetchQueue(); // save failed: show what's really in the sheet
+        });
+    }
+
+    // Same rules as server.js: the singer on stage is the first Waiting row; the rest are up next
+    function onStage(queue) {
+      return queue.find(item => item.status === 'Current') || queue.find(item => item.status === 'Waiting');
+    }
+    function upNext(queue) {
+      const current = onStage(queue);
+      return queue.filter(item => item.status === 'Waiting' && item !== current);
     }
 
     // Names and songs are typed by people, so always insert them as plain text, never as HTML
@@ -236,12 +270,15 @@
     }
 
     async function fetchQueue() {
+      const startedAt = Date.now();
       try {
         const res = await fetch('/api/queue');
         // Signed out (here or in another browser) or session expired: stop polling
         if (await signedOut(res)) return;
         if (!res.ok) return; // server or sheet unreachable: keep what's showing, try again next poll
         const data = await res.json();
+        // A click is saving, or saved after this poll started: this reply is out of date
+        if (pendingSaves > 0 || startedAt < lastSaveDone) return;
         renderQueue(data);
       } catch (err) {
         console.error("Error fetching queue:", err);
@@ -265,7 +302,10 @@
       }, FIREWORKS_DURATION_MS);
     }
 
+    let lastQueue = []; // what's on screen, so admin actions can show their change right away
+
     function renderQueue(data) {
+      lastQueue = data;
       const activeQueue = data.filter(item => item.status !== "Completed");
       // The singer on stage is the first Waiting row ("Current" still honored for older rows)
       const current = activeQueue.find(item => item.status === "Current") || activeQueue.find(item => item.status === "Waiting");
@@ -319,7 +359,10 @@
           row.className = item === current ? 'bg-amber-500/20 text-amber-300 font-bold border-b border-slate-800' : 'border-b border-slate-800';
           
           let actionButtons = '<span class="text-xs text-slate-500">On Stage</span>';
-          if (item !== current) {
+          if (item.pending) {
+            // Just added: no id from the server yet, so no buttons until the save finishes
+            actionButtons = '<span class="text-xs text-slate-500">Saving…</span>';
+          } else if (item !== current) {
             const id = String(item.id).replace(/[^0-9]/g, ''); // ids are numbers; strip anything else
             actionButtons = `
               <button onclick="moveSinger('${id}', 'up')" title="Move up" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded mr-1 inline-flex items-center gap-1 text-sm align-middle">
@@ -376,32 +419,44 @@
     // Going full screen changes the text size, so re-measure the ticker
     window.addEventListener('resize', () => setTicker(lastTickerPasses, true));
 
-    async function addSinger(e) {
+    function addSinger(e) {
       e.preventDefault();
-      const singer = document.getElementById('singer-name').value;
-      const song = document.getElementById('song-title').value;
-      
-      await adminPost('/api/queue/add', { singer, song });
-
+      const singer = document.getElementById('singer-name').value.trim();
+      const song = document.getElementById('song-title').value.trim();
       document.getElementById('singer-name').value = '';
       document.getElementById('song-title').value = '';
-      fetchQueue();
+
+      saveAction('/api/queue/add', { singer, song }, queue => [
+        ...queue,
+        { id: 'new', singer, song, status: 'Waiting', timestamp: 'Saving…', pending: true },
+      ]);
     }
 
-    async function nextSinger() {
-      await adminPost('/api/queue/next');
-      fetchQueue();
+    function nextSinger() {
+      saveAction('/api/queue/next', {}, queue => {
+        const current = onStage(queue);
+        if (current) current.status = 'Completed';
+        return queue;
+      });
     }
 
-    async function moveSinger(id, direction) {
-      await adminPost('/api/queue/move', { id, direction });
-      fetchQueue();
+    function moveSinger(id, direction) {
+      saveAction('/api/queue/move', { id, direction }, queue => {
+        // Swap with the neighbor among the singers up next (same as server.js)
+        const waiting = upNext(queue);
+        const from = waiting.findIndex(item => String(item.id) === id);
+        const to = direction === 'up' ? from - 1 : from + 1;
+        if (from === -1 || to < 0 || to >= waiting.length) return queue;
+        const a = queue.indexOf(waiting[from]);
+        const b = queue.indexOf(waiting[to]);
+        [queue[a], queue[b]] = [queue[b], queue[a]];
+        return queue;
+      });
     }
 
-    async function removeSinger(id) {
+    function removeSinger(id) {
       if (!confirm('Remove this singer from the queue?')) return;
-      await adminPost('/api/queue/remove', { id });
-      fetchQueue();
+      saveAction('/api/queue/remove', { id }, queue => queue.filter(item => String(item.id) !== id));
     }
   </script>
 

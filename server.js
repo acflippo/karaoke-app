@@ -100,24 +100,28 @@ api.post('/queue/add', requireAdmin, async (req, res) => {
     }
 
     const queue = await readQueue();
-    queue.push({ id: Date.now(), singer, song, status: 'Waiting', timestamp: sheetTimestamp() });
-    await writeQueue(queue);
-    res.json({ success: true });
+    const newQueue = [...queue, { id: Date.now(), singer, song, status: 'Waiting', timestamp: sheetTimestamp() }];
+    await writeQueue(newQueue, queue.length);
+    res.json({ success: true, queue: newQueue });
 });
 
 // POST advance next singer & log completed singer to the history tab
 api.post('/queue/next', requireAdmin, async (req, res) => {
     const queue = await readQueue();
     const current = onStage(queue);
-    if (!current) return res.json({ success: true });
+    if (!current) return res.json({ success: true, queue });
 
     // Performance number for the history tab (#1, #2, etc.)
     const orderNumber = queue.filter(item => item.status === 'Completed').length + 1;
-    await appendHistory(sheetTimestamp(), orderNumber, current.singer, current.song);
 
-    // Mark them Completed; the next Waiting row is now on stage
-    await writeQueue(queue.map(item => (item === current ? { ...item, status: 'Completed' } : item)));
-    res.json({ success: true });
+    // Mark them Completed; the next Waiting row is now on stage.
+    // The history row and the queue are saved at the same time (one wait instead of two).
+    const newQueue = queue.map(item => (item === current ? { ...item, status: 'Completed' } : item));
+    await Promise.all([
+        appendHistory(sheetTimestamp(), orderNumber, current.singer, current.song),
+        writeQueue(newQueue, queue.length),
+    ]);
+    res.json({ success: true, queue: newQueue });
 });
 
 // POST Move singer up/down in queue
@@ -135,7 +139,7 @@ api.post('/queue/move', requireAdmin, async (req, res) => {
     const swapIndexInWaiting = direction === 'up' ? targetIndexInWaiting - 1 : targetIndexInWaiting + 1;
 
     if (swapIndexInWaiting < 0 || swapIndexInWaiting >= waitingItems.length) {
-        return res.json({ success: true });
+        return res.json({ success: true, queue });
     }
 
     const itemToMove = waitingItems[targetIndexInWaiting];
@@ -150,8 +154,8 @@ api.post('/queue/move', requireAdmin, async (req, res) => {
         return item;
     });
 
-    await writeQueue(newQueue);
-    res.json({ success: true });
+    await writeQueue(newQueue, queue.length);
+    res.json({ success: true, queue: newQueue });
 });
 
 // POST Remove a waiting singer from the queue
@@ -163,8 +167,9 @@ api.post('/queue/remove', requireAdmin, async (req, res) => {
     const target = upNext(queue).find(item => item.id == id);
     if (!target) return res.status(400).json({ error: 'Item not found or not waiting' });
 
-    await writeQueue(queue.filter(item => item !== target));
-    res.json({ success: true });
+    const newQueue = queue.filter(item => item !== target);
+    await writeQueue(newQueue, queue.length);
+    res.json({ success: true, queue: newQueue });
 });
 
 // Same routes locally (/api/...) and on Netlify (/.netlify/functions/api/...)
