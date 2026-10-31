@@ -54,7 +54,7 @@ To give someone access, add their Gmail address to the `admins` tab. To remove a
      ```
      node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
      ```
-   - `TIME_ZONE`: your venue's time zone, e.g. `America/Los_Angeles`
+   - `TIME_ZONE`: your venue's time zone.
 4. Connect your Google account (first time only). Sign in with the account that owns the sheet (or has Editor access to it) and tick every permission box. This saves `GOOGLE_REFRESH_TOKEN` into `.env`. If `SHEET_ID` is set, it checks that sheet opens; if it's empty, it creates a new sheet named `Karaoke-App-Annie-yyyy-mm-dd hh:mi:ss` in your Google Drive and saves its `SHEET_ID` into `.env`:
    ```
    node scripts/authorize.js
