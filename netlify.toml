@@ -1,0 +1,25 @@
+[build]
+  publish = "public"
+  functions = "netlify/functions"
+  # The pages live in public/, the pictures and video in images/; copy them together for publishing
+  command = "cp -R images public/"
+
+# All /api/... requests go to the Express app (netlify/functions/api.js)
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+
+# Serve the fireworks video as video/mp4 so Chrome plays it
+[[headers]]
+  for = "/images/firework_loop.mov"
+  [headers.values]
+    Content-Type = "video/mp4"
+
+# Basic security headers for every page
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"

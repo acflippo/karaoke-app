@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>KJ Sign In</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://accounts.google.com/gsi/client" async></script>
+</head>
+<body class="bg-slate-950 text-white font-sans min-h-screen flex items-center justify-center p-6">
+
+  <main class="bg-slate-900 border border-slate-800 rounded-2xl p-8 w-full max-w-sm text-center shadow-2xl">
+    <h1 class="text-3xl font-bold text-amber-400 mb-2">KJ Control Panel</h1>
+    <p class="text-slate-400 mb-8">Sign in with an approved Google account</p>
+
+    <div id="google-button" class="flex justify-center min-h-[44px]"></div>
+
+    <p id="message" class="mt-6 text-sm text-rose-400 hidden"></p>
+  </main>
+
+  <script>
+    function showMessage(text) {
+      const el = document.getElementById('message');
+      el.textContent = text;
+      el.classList.remove('hidden');
+    }
+
+    // Google calls this with an ID token after the user picks an account
+    async function handleCredential(response) {
+      const res = await fetch('/api/auth/google', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ credential: response.credential })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        window.location.href = '/';
+      } else {
+        showMessage(data.error || 'Sign-in failed. Please try again.');
+      }
+    }
+
+    async function init() {
+      if (new URLSearchParams(window.location.search).get('reason') === 'idle') {
+        showMessage('You were signed out after 1 hour with no activity. Sign in again to continue.');
+      }
+
+      // Already signed in? Go straight to the console
+      const me = await fetch('/api/auth/me');
+      if (me.ok) {
+        window.location.href = '/';
+        return;
+      }
+
+      const { googleClientId } = await (await fetch('/api/config')).json();
+      if (!googleClientId) {
+        showMessage('Google sign-in is not configured (GOOGLE_CLIENT_ID is missing).');
+        return;
+      }
+
+      // The Google script loads asynchronously; wait for it
+      while (!window.google?.accounts?.id) {
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+      google.accounts.id.initialize({ client_id: googleClientId, callback: handleCredential });
+      google.accounts.id.renderButton(document.getElementById('google-button'), {
+        theme: 'filled_black',
+        size: 'large',
+        shape: 'pill',
+        text: 'signin_with'
+      });
+    }
+
+    init().catch(() => showMessage('Could not reach the server. Please refresh.'));
+  </script>
+</body>
+</html>

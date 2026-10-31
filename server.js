@@ -1,13 +1,17 @@
 const express = require('express');
-const fs = require('fs');
 const path = require('path');
+
+// Local development: load settings from .env (on Netlify they come from Site settings → Environment variables)
+try { process.loadEnvFile(path.join(__dirname, '.env')); } catch { /* no .env file */ }
+
+const { readQueue, writeQueue, appendHistory, isAdmin, getQrLinks } = require('./lib/sheets');
+const { verifyGoogleToken, setSessionCookie, clearSessionCookie, requireAdmin, touchSession } = require('./lib/auth');
 
 const app = express();
 const PORT = 3000;
-const DATA_FILE = path.join(__dirname, 'queue.json');
-const CSV_FILE = path.join(__dirname, 'history.csv');
+const MAX_FIELD_LENGTH = 100;
 
-app.use(express.json());
+app.use(express.json({ limit: '10kb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 // Serve .mov as video/mp4 so Chrome plays H.264 QuickTime files (Safari plays either)
 app.use('/images', express.static(path.join(__dirname, 'images'), {
@@ -16,99 +20,114 @@ app.use('/images', express.static(path.join(__dirname, 'images'), {
     }
 }));
 
-// Helper: Read queue
-function readQueue() {
-    if (!fs.existsSync(DATA_FILE)) {
-        fs.writeFileSync(DATA_FILE, JSON.stringify([]));
-    }
-    const data = fs.readFileSync(DATA_FILE, 'utf8');
-    return JSON.parse(data);
+// Current time as "2026/11/30, 11:12:06 AM" in the venue's time zone (Netlify servers run on UTC)
+function sheetTimestamp() {
+    const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
+        timeZone: process.env.TIME_ZONE || undefined,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true,
+    }).formatToParts(new Date()).map(p => [p.type, p.value]));
+    return `${parts.year}/${parts.month}/${parts.day}, ${parts.hour}:${parts.minute}:${parts.second} ${parts.dayPeriod}`;
 }
 
-// Helper: Write queue
-function writeQueue(queue) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify(queue, null, 2));
+// The singer on stage is the first Waiting row ("Current" is still honored for older rows);
+// everyone else who is Waiting is up next, in sheet order
+function onStage(queue) {
+    return queue.find(item => item.status === 'Current') || queue.find(item => item.status === 'Waiting');
+}
+function upNext(queue) {
+    const current = onStage(queue);
+    return queue.filter(item => item.status === 'Waiting' && item !== current);
 }
 
-// Helper: Append completed singer details to CSV
-function appendToCSV(orderNumber, singer, song) {
-    const csvHeader = 'Completion Time,Order Number,Singer,Song\n';
-    
-    // Create file with headers if it doesn't exist
-    if (!fs.existsSync(CSV_FILE)) {
-        fs.writeFileSync(CSV_FILE, csvHeader);
-    }
+const api = express.Router();
 
-    const timeString = new Date().toLocaleString();
-    
-    // Escape quotes to prevent CSV formatting issues
-    const safeSinger = `"${singer.replace(/"/g, '""')}"`;
-    const safeSong = `"${song.replace(/"/g, '""')}"`;
+// ---------- Login ----------
 
-    const row = `"${timeString}",${orderNumber},${safeSinger},${safeSong}\n`;
-    fs.appendFileSync(CSV_FILE, row);
-}
-
-// GET current queue
-app.get('/api/queue', (req, res) => {
-    res.json(readQueue());
+// Public settings the login page needs
+api.get('/config', (req, res) => {
+    res.json({ googleClientId: process.env.GOOGLE_CLIENT_ID });
 });
 
-// POST add singer
-app.post('/api/queue/add', (req, res) => {
-    const { singer, song } = req.body;
-    if (!singer || !song) return res.status(400).json({ error: 'Missing fields' });
+// Sign in with a Google ID token; only emails in the "admins" tab are allowed
+api.post('/auth/google', async (req, res) => {
+    let email;
+    try {
+        email = await verifyGoogleToken(req.body.credential);
+    } catch {
+        return res.status(401).json({ error: 'Google sign-in could not be verified' });
+    }
+    if (!(await isAdmin(email))) {
+        return res.status(403).json({ error: `${email} is not on the admin list` });
+    }
+    setSessionCookie(req, res, email);
+    res.json({ email });
+});
 
-    const queue = readQueue();
-    const newId = Date.now();
-    const timestamp = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-    const status = queue.length === 0 ? 'Current' : 'Waiting';
-
-    queue.push({ id: newId, singer, song, status, timestamp });
-    writeQueue(queue);
+api.post('/auth/logout', (req, res) => {
+    clearSessionCookie(res);
     res.json({ success: true });
 });
 
-// POST advance next singer & log completed singer to CSV
-app.post('/api/queue/next', (req, res) => {
-    let queue = readQueue();
-    let foundCurrent = false;
+api.get('/auth/me', requireAdmin, (req, res) => {
+    res.json({ email: req.adminEmail });
+});
 
-    // Calculate total completed count to track performance order number (#1, #2, etc.)
-    const completedCount = queue.filter(item => item.status === 'Completed').length;
-    const currentOrderNumber = completedCount + 1;
+// The admin console reports clicks here; restarts the idle sign-out timer
+api.post('/auth/activity', requireAdmin, touchSession);
 
-    // 1. Mark current performance as completed and export to CSV
-    queue = queue.map(item => {
-        if (item.status === 'Current') {
-            foundCurrent = true;
-            // Save to CSV
-            appendToCSV(currentOrderNumber, item.singer, item.song);
-            return { ...item, status: 'Completed', orderNumber: currentOrderNumber };
-        }
-        return item;
-    });
+// ---------- QR code links ----------
 
-    // 2. Activate the next waiting singer
-    let activated = false;
-    queue = queue.map(item => {
-        if (!activated && item.status === 'Waiting') {
-            activated = true;
-            return { ...item, status: 'Current' };
-        }
-        return item;
-    });
+// GET Venmo and song list links from the sheet (signed-in only, so an unattended screen can't keep calling the server)
+api.get('/links', requireAdmin, async (req, res) => {
+    res.json(await getQrLinks());
+});
 
-    writeQueue(queue);
+// ---------- Queue ----------
+
+// GET current queue (signed-in only: the display screen stops polling once this returns 401)
+api.get('/queue', requireAdmin, async (req, res) => {
+    res.json(await readQueue());
+});
+
+// POST add singer
+api.post('/queue/add', requireAdmin, async (req, res) => {
+    const singer = typeof req.body.singer === 'string' ? req.body.singer.trim() : '';
+    const song = typeof req.body.song === 'string' ? req.body.song.trim() : '';
+    if (!singer || !song) return res.status(400).json({ error: 'Missing fields' });
+    if (singer.length > MAX_FIELD_LENGTH || song.length > MAX_FIELD_LENGTH) {
+        return res.status(400).json({ error: `Singer and song must be ${MAX_FIELD_LENGTH} characters or less` });
+    }
+
+    const queue = await readQueue();
+    queue.push({ id: Date.now(), singer, song, status: 'Waiting', timestamp: sheetTimestamp() });
+    await writeQueue(queue);
+    res.json({ success: true });
+});
+
+// POST advance next singer & log completed singer to the history tab
+api.post('/queue/next', requireAdmin, async (req, res) => {
+    const queue = await readQueue();
+    const current = onStage(queue);
+    if (!current) return res.json({ success: true });
+
+    // Performance number for the history tab (#1, #2, etc.)
+    const orderNumber = queue.filter(item => item.status === 'Completed').length + 1;
+    await appendHistory(sheetTimestamp(), orderNumber, current.singer, current.song);
+
+    // Mark them Completed; the next Waiting row is now on stage
+    await writeQueue(queue.map(item => (item === current ? { ...item, status: 'Completed' } : item)));
     res.json({ success: true });
 });
 
 // POST Move singer up/down in queue
-app.post('/api/queue/move', (req, res) => {
+api.post('/queue/move', requireAdmin, async (req, res) => {
     const { id, direction } = req.body;
-    let queue = readQueue();
-    
-    const waitingItems = queue.filter(item => item.status === 'Waiting');
+    let queue = await readQueue();
+
+    // Only singers up next can move; the singer on stage stays put
+    const current = onStage(queue);
+    const waitingItems = upNext(queue);
     const targetIndexInWaiting = waitingItems.findIndex(item => item.id == id);
 
     if (targetIndexInWaiting === -1) return res.status(400).json({ error: 'Item not found or not waiting' });
@@ -125,41 +144,56 @@ app.post('/api/queue/move', (req, res) => {
 
     let waitingIdx = 0;
     const newQueue = queue.map(item => {
-        if (item.status === 'Waiting') {
+        if (item.status === 'Waiting' && item !== current) {
             return waitingItems[waitingIdx++];
         }
         return item;
     });
 
-    writeQueue(newQueue);
+    await writeQueue(newQueue);
     res.json({ success: true });
 });
 
 // POST Remove a waiting singer from the queue
-app.post('/api/queue/remove', (req, res) => {
+api.post('/queue/remove', requireAdmin, async (req, res) => {
     const { id } = req.body;
-    const queue = readQueue();
+    const queue = await readQueue();
 
-    const target = queue.find(item => item.id == id && item.status === 'Waiting');
+    // The singer on stage can't be removed (use Next Singer)
+    const target = upNext(queue).find(item => item.id == id);
     if (!target) return res.status(400).json({ error: 'Item not found or not waiting' });
 
-    writeQueue(queue.filter(item => item !== target));
+    await writeQueue(queue.filter(item => item !== target));
     res.json({ success: true });
 });
 
-const server = app.listen(PORT, () => {
-    console.log(`🎤 Karaoke app running locally!`);
-    console.log(`👉 Laptop View: http://localhost:${PORT}`);
-    console.log(`👉 iPad View: http://<YOUR-LAPTOP-IP>:${PORT}`);
+// Same routes locally (/api/...) and on Netlify (/.netlify/functions/api/...)
+app.use(['/api', '/.netlify/functions/api'], api);
+
+// Errors (e.g. Google Sheets unreachable): log the details, return a generic message
+app.use((err, req, res, next) => {
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
 });
 
-// Graceful shutdown on Ctrl+C
-process.on('SIGINT', () => {
-    console.log('\n🛑 Shutting down karaoke server gracefully...');
-    server.close(() => {
-        console.log('✅ Server closed. All connections closed.');
-        process.exit(0);
+module.exports = app;
+
+// Run as a normal server with `node server.js` (Netlify imports the app instead)
+if (require.main === module) {
+    const server = app.listen(PORT, () => {
+        console.log(`🎤 Karaoke app running locally!`);
+        console.log(`👉 Laptop View: http://localhost:${PORT}`);
+        console.log(`👉 iPad View: http://<YOUR-LAPTOP-IP>:${PORT}`);
     });
-    // Drop idle keep-alive connections (e.g. an open display screen) so close() finishes promptly
-    server.closeAllConnections();
-});
+
+    // Graceful shutdown on Ctrl+C
+    process.on('SIGINT', () => {
+        console.log('\n🛑 Shutting down karaoke server gracefully...');
+        server.close(() => {
+            console.log('✅ Server closed. All connections closed.');
+            process.exit(0);
+        });
+        // Drop idle keep-alive connections (e.g. an open display screen) so close() finishes promptly
+        server.closeAllConnections();
+    });
+}

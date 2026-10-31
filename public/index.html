@@ -12,18 +12,21 @@
     html.display-mode {
       font-size: clamp(12px, min(100vw / 90, 100vh / 56), 48px);
     }
-    /* Ticker: padding-left (100% of the ticker bar's width) starts the text just off the
-       right edge, so it appears right away no matter how long the queue text is */
+    /* Ticker: the queue text is repeated back to back (see setTicker) and slides left by exactly
+       one cycle, so it loops seamlessly. --ticker-shift and --ticker-duration are set by setTicker. */
     @keyframes marquee {
-      0% { transform: translateX(0); }
-      100% { transform: translateX(-100%); }
+      from { transform: translateX(0); }
+      to { transform: translateX(calc(-1 * var(--ticker-shift, 50%))); }
     }
     .animate-marquee {
       display: inline-block;
       white-space: nowrap;
-      padding-left: 100%;
-      animation: marquee 45s linear infinite;
+      animation: marquee var(--ticker-duration, 45s) linear infinite;
       animation-delay: 0s; /* pause before the ticker first starts, e.g. 2s */
+    }
+    .ticker-copy {
+      display: inline-block;
+      padding-right: 20rem; /* blank space between repeats of the queue */
     }
     /* Fireworks overlay: "screen" blending drops the video's black background */
     #fireworks {
@@ -82,19 +85,24 @@
 <body class="bg-slate-950 text-white font-sans min-h-screen flex flex-col">
 
   <script>
-    // Configuration URLs for QR Codes
-    const SONG_LIST_URL = "https://docs.google.com/spreadsheets/d/1G6BL5ardBrdVmFa7o0e_fMW2RMBk0iOYhu4e-Pi4Ltg/edit?usp=sharing";
-    const VENMO_URL = "https://venmo.com/u/AnnieFlippo";
+    // QR code links come only from the Google Sheet: venmo_url tab and song_list_url cell A1
 
     const urlParams = new URLSearchParams(window.location.search);
     const isDisplayView = urlParams.get('view') === 'display';
     if (isDisplayView) document.documentElement.classList.add('display-mode');
 
-    document.addEventListener('DOMContentLoaded', () => {
-      // Extra large QR Codes
-      document.getElementById('qr-songs').src = `https://api.qrserver.com/v1/create-qr-code/?size=600x600&data=${encodeURIComponent(SONG_LIST_URL)}`;
-      document.getElementById('qr-venmo').src = `https://api.qrserver.com/v1/create-qr-code/?size=600x600&data=${encodeURIComponent(VENMO_URL)}`;
+    // Polling timers: started only after sign-in, all cleared on sign-out so an unattended
+    // screen doesn't keep calling the server (each call is a billed Netlify function run)
+    let queueTimer, linksTimer;
 
+    // Lets the console tab tell an open display tab (same browser) that you signed out
+    const authChannel = 'BroadcastChannel' in window ? new BroadcastChannel('karaoke-auth') : null;
+    if (authChannel) authChannel.onmessage = (e) => {
+      if (e.data === 'signed-out') goToLogin();
+      if (e.data === 'signed-out-idle') goToLogin('idle');
+    };
+
+    document.addEventListener('DOMContentLoaded', () => {
       // Fireworks video speed: 1 = normal, 0.5 = half speed, 0.25 = very slow
       const FIREWORKS_SPEED = 0.65;
       ['fireworks-bg', 'fireworks'].forEach(id => {
@@ -113,18 +121,126 @@
         }, FIREWORKS_PAUSE_MS);
       });
 
-      if (isDisplayView) {
-        document.getElementById('admin-panel').classList.add('hidden');
-        document.getElementById('display-panel').classList.remove('hidden');
-      }
-
-      fetchQueue();
-      setInterval(fetchQueue, 3000);
+      // Both views are only shown to signed-in, whitelisted Google accounts
+      checkSignIn();
     });
+
+    function startPolling() {
+      fetchQueue();
+      queueTimer = setInterval(fetchQueue, 3000);
+      if (isDisplayView) {
+        // Extra large QR Codes; re-check the sheet every minute so link changes show up without a reload
+        loadQrLinks();
+        linksTimer = setInterval(loadQrLinks, 60000);
+      }
+    }
+
+    function stopPolling() {
+      clearInterval(queueTimer);
+      clearInterval(linksTimer);
+    }
+
+    // Signed out or session expired: stop all polling and show the login page
+    function goToLogin(reason) {
+      stopPolling();
+      window.location.href = reason === 'idle' ? '/login.html?reason=idle' : '/login.html';
+    }
+
+    // For a 401/403 response: go to the login page (saying why if it timed out) and return true
+    async function signedOut(res) {
+      if (res.status !== 401 && res.status !== 403) return false;
+      const data = await res.json().catch(() => ({}));
+      if (authChannel) authChannel.postMessage(data.idle ? 'signed-out-idle' : 'signed-out');
+      goToLogin(data.idle ? 'idle' : undefined);
+      return true;
+    }
+
+    // Idle sign-out: clicks and typing on the admin console tell the server you're still here
+    // (at most once a minute). After an hour without any, the server ends the session and the
+    // next queue poll here and on the display screen gets a 401, which stops all polling.
+    const ACTIVITY_REPORT_MS = 60 * 1000;
+    let lastActivityReport = 0; // the first click after loading the page always reports
+
+    // Kept so signOut can wait for it: a report that finishes after logout would sign you back in
+    let activityRequest = Promise.resolve();
+    let signingOut = false;
+
+    function reportActivity() {
+      if (signingOut || Date.now() - lastActivityReport < ACTIVITY_REPORT_MS) return;
+      lastActivityReport = Date.now();
+      activityRequest = fetch('/api/auth/activity', { method: 'POST' })
+        .then(res => signedOut(res))
+        .catch(err => console.error("Error reporting activity:", err));
+    }
+
+    async function checkSignIn() {
+      const res = await fetch('/api/auth/me');
+      if (!res.ok) return (await signedOut(res)) || goToLogin();
+      const { email } = await res.json();
+      if (isDisplayView) {
+        document.getElementById('display-panel').classList.remove('hidden');
+      } else {
+        document.getElementById('admin-email').textContent = email;
+        document.getElementById('admin-panel').classList.remove('hidden');
+        ['click', 'keydown'].forEach(type => document.addEventListener(type, reportActivity));
+      }
+      startPolling();
+    }
+
+    async function signOut() {
+      signingOut = true; // the Sign out click itself must not count as activity
+      stopPolling();
+      if (authChannel) authChannel.postMessage('signed-out');
+      await activityRequest; // let any activity report land first so logout's cleared cookie wins
+      await fetch('/api/auth/logout', { method: 'POST' });
+      goToLogin();
+    }
+
+    // Sends an admin action; goes back to the login page if the session expired
+    async function adminPost(url, body) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {})
+      });
+      if (await signedOut(res)) return;
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        alert(data.error || 'Something went wrong. Please try again.');
+      }
+    }
+
+    // Names and songs are typed by people, so always insert them as plain text, never as HTML
+    function escapeHtml(text) {
+      return String(text ?? '').replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+    }
+
+    function setQrCode(imgId, url) {
+      if (!url) return; // no link in the sheet: keep whatever is showing
+      const src = `https://api.qrserver.com/v1/create-qr-code/?size=600x600&data=${encodeURIComponent(url)}`;
+      const img = document.getElementById(imgId);
+      if (img.getAttribute('src') !== src) img.src = src; // only reload the image when the link changed
+    }
+
+    async function loadQrLinks() {
+      try {
+        const res = await fetch('/api/links', { cache: 'no-store' });
+        if (await signedOut(res)) return;
+        if (!res.ok) return; // server or sheet unreachable: keep the QR codes already showing
+        const links = await res.json();
+        setQrCode('qr-songs', links.songListUrl);
+        setQrCode('qr-venmo', links.venmoUrl);
+      } catch (err) {
+        console.error("Error fetching QR links:", err);
+      }
+    }
 
     async function fetchQueue() {
       try {
         const res = await fetch('/api/queue');
+        // Signed out (here or in another browser) or session expired: stop polling
+        if (await signedOut(res)) return;
+        if (!res.ok) return; // server or sheet unreachable: keep what's showing, try again next poll
         const data = await res.json();
         renderQueue(data);
       } catch (err) {
@@ -151,8 +267,9 @@
 
     function renderQueue(data) {
       const activeQueue = data.filter(item => item.status !== "Completed");
-      const current = activeQueue.find(item => item.status === "Current");
-      const waiting = activeQueue.filter(item => item.status === "Waiting");
+      // The singer on stage is the first Waiting row ("Current" still honored for older rows)
+      const current = activeQueue.find(item => item.status === "Current") || activeQueue.find(item => item.status === "Waiting");
+      const waiting = activeQueue.filter(item => item.status === "Waiting" && item !== current);
 
       if (isDisplayView) {
         const currentId = current ? current.id : null;
@@ -171,13 +288,26 @@
         document.getElementById('now-song').innerText = "Add a song to get started";
       }
 
-      // Ticker Update: Limit to max 6 upcoming singers, single "NEXT UP" label, no quotes
+      // Ticker Update: next 5 singers, single "NEXT UP" label, no quotes, then a tip message
+      // that rotates each pass: message 1, then 2, then 3, then back to 1, ...
+      // To add a message, define it below AND add a matching line inside setTicker([...])
+      const TICKER_SINGER_COUNT = 5;
+      const TICKER_TIP_MESSAGE_1 = "Having a good time?  Don't forget to tip the bartender and the band ... thank you! 🎉🎉🎉";
+      const TICKER_TIP_MESSAGE_2 = "Enjoying the show?  We appreciate your tips ... thanks! 🥳";
+      const TICKER_TIP_MESSAGE_3 = "Drink responsibly, tip recklessly ... we appreciate it! 🎊";
+      const separator = " &nbsp;&nbsp;&nbsp;•&nbsp;&nbsp;&nbsp;&nbsp;";
+  
       if (waiting.length > 0) {
-        const limitedWaiting = waiting.slice(0, 6);
-        const upcomingList = limitedWaiting.map((w, idx) => `#${idx + 1} ${w.singer} - ${w.song}`).join(" &nbsp;&nbsp;&nbsp;•&nbsp;&nbsp;&nbsp; ");
-        document.getElementById('ticker-content').innerHTML = `<strong>NEXT UP:</strong> &nbsp;&nbsp;&nbsp;•&nbsp;&nbsp;&nbsp; ${upcomingList}`;
+        const limitedWaiting = waiting.slice(0, TICKER_SINGER_COUNT);
+        const upcomingList = limitedWaiting.map((w, idx) => `#${idx + 1} ${escapeHtml(w.singer)} - ${escapeHtml(w.song)}`).join(separator);
+        const queueText = `<strong>NEXT UP:</strong>&nbsp;&nbsp;&nbsp;&nbsp;${upcomingList}${separator}`;
+        setTicker([
+          queueText + escapeHtml(TICKER_TIP_MESSAGE_1),
+          queueText + escapeHtml(TICKER_TIP_MESSAGE_2),
+          queueText + escapeHtml(TICKER_TIP_MESSAGE_3),
+        ]);
       } else {
-        document.getElementById('ticker-content').innerText = "Queue is clear — scan the QR code to request a song!";
+        setTicker(["Queue is clear — scan the QR code to request a song!"]);
       }
 
       // Admin Table Update
@@ -186,32 +316,33 @@
         queueList.innerHTML = '';
         activeQueue.forEach((item) => {
           const row = document.createElement('tr');
-          row.className = item.status === 'Current' ? 'bg-amber-500/20 text-amber-300 font-bold border-b border-slate-800' : 'border-b border-slate-800';
+          row.className = item === current ? 'bg-amber-500/20 text-amber-300 font-bold border-b border-slate-800' : 'border-b border-slate-800';
           
           let actionButtons = '<span class="text-xs text-slate-500">On Stage</span>';
-          if (item.status === 'Waiting') {
+          if (item !== current) {
+            const id = String(item.id).replace(/[^0-9]/g, ''); // ids are numbers; strip anything else
             actionButtons = `
-              <button onclick="moveSinger('${item.id}', 'up')" title="Move up" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded mr-1 inline-flex items-center gap-1 text-sm align-middle">
+              <button onclick="moveSinger('${id}', 'up')" title="Move up" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded mr-1 inline-flex items-center gap-1 text-sm align-middle">
                 <img src="/images/green_up_arrow.png" alt="" class="h-4 w-auto" /> Up
               </button>
-              <button onclick="moveSinger('${item.id}', 'down')" title="Move down" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded inline-flex items-center gap-1 text-sm align-middle">
+              <button onclick="moveSinger('${id}', 'down')" title="Move down" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded inline-flex items-center gap-1 text-sm align-middle">
                 <img src="/images/red_down_arrow.png" alt="" class="h-4 w-auto" /> Down
               </button>
-              <button onclick="removeSinger('${item.id}')" title="Remove from queue" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded ml-1 inline-flex items-center gap-1 text-sm align-middle">
+              <button onclick="removeSinger('${id}')" title="Remove from queue" class="bg-slate-800 hover:bg-slate-700 px-2 py-1 rounded ml-1 inline-flex items-center gap-1 text-sm align-middle">
                 <img src="/images/delete-button.png" alt="" class="h-4 w-auto" /> Remove
               </button>
             `;
           }
 
           // Order: current singer = 0, next up = 1, and so on (matches the "#1, #2" on the display ticker)
-          const order = item.status === 'Current' ? 0 : waiting.indexOf(item) + 1;
+          const order = item === current ? 0 : waiting.indexOf(item) + 1;
 
           row.innerHTML = `
             <td class="p-3 text-2xl font-black text-center">${order}</td>
-            <td class="p-3">${item.status === 'Current' ? '🎤 ON STAGE' : 'Waiting'}</td>
-            <td class="p-3">${item.singer}</td>
-            <td class="p-3">${item.song}</td>
-            <td class="p-3 text-slate-400 text-sm">${item.timestamp}</td>
+            <td class="p-3">${item === current ? '🎤 ON STAGE' : 'Waiting'}</td>
+            <td class="p-3">${escapeHtml(item.singer)}</td>
+            <td class="p-3">${escapeHtml(item.song)}</td>
+            <td class="p-3 text-slate-400 text-sm">${escapeHtml(item.timestamp)}</td>
             <td class="p-3 text-right whitespace-nowrap">${actionButtons}</td>
           `;
           queueList.appendChild(row);
@@ -219,16 +350,38 @@
       }
     }
 
+    // Ticker scroll speed in rem per second (scales with the screen like the rest of the display)
+    const TICKER_SPEED = 8;
+    let lastTickerPasses = [];
+
+    // passes = the text for each pass in order (e.g. queue + message 1, queue + message 2).
+    // One "cycle" is all passes back to back; the cycle is repeated so the ticker loops
+    // seamlessly without a long blank gap, sliding left by exactly one cycle.
+    function setTicker(passes, force = false) {
+      if (!isDisplayView || (passes.join('|') === lastTickerPasses.join('|') && !force)) return; // unchanged: don't restart the scroll
+      lastTickerPasses = passes;
+      const el = document.getElementById('ticker-content');
+      const cycleHtml = passes.map(html => `<span class="ticker-copy">${html}</span>`).join('');
+      el.innerHTML = cycleHtml;
+      const cycleWidth = el.scrollWidth;
+      if (!cycleWidth) return;
+      // Enough cycles to always fill the bar, even when the text is shorter than the screen
+      const cycles = Math.max(2, Math.ceil(el.parentElement.clientWidth / cycleWidth) + 1);
+      el.innerHTML = cycleHtml.repeat(cycles);
+      const remPx = parseFloat(getComputedStyle(document.documentElement).fontSize);
+      el.style.setProperty('--ticker-shift', `${cycleWidth}px`);
+      el.style.setProperty('--ticker-duration', `${cycleWidth / (TICKER_SPEED * remPx)}s`);
+    }
+
+    // Going full screen changes the text size, so re-measure the ticker
+    window.addEventListener('resize', () => setTicker(lastTickerPasses, true));
+
     async function addSinger(e) {
       e.preventDefault();
       const singer = document.getElementById('singer-name').value;
       const song = document.getElementById('song-title').value;
       
-      await fetch('/api/queue/add', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ singer, song })
-      });
+      await adminPost('/api/queue/add', { singer, song });
 
       document.getElementById('singer-name').value = '';
       document.getElementById('song-title').value = '';
@@ -236,26 +389,18 @@
     }
 
     async function nextSinger() {
-      await fetch('/api/queue/next', { method: 'POST' });
+      await adminPost('/api/queue/next');
       fetchQueue();
     }
 
     async function moveSinger(id, direction) {
-      await fetch('/api/queue/move', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id, direction })
-      });
+      await adminPost('/api/queue/move', { id, direction });
       fetchQueue();
     }
 
     async function removeSinger(id) {
       if (!confirm('Remove this singer from the queue?')) return;
-      await fetch('/api/queue/remove', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ id })
-      });
+      await adminPost('/api/queue/remove', { id });
       fetchQueue();
     }
   </script>
@@ -349,12 +494,17 @@
   </main>
 
   <!-- ADMIN / OPERATOR PANEL -->
-  <main id="admin-panel" class="flex-1 p-6 max-w-5xl mx-auto w-full">
+  <!-- Hidden until sign-in is confirmed (see checkSignIn) -->
+  <main id="admin-panel" class="flex-1 p-6 max-w-5xl mx-auto w-full hidden">
     <div class="flex justify-between items-center mb-6">
-      <h1 class="text-3xl font-bold text-amber-400">KJ Control Panel (Local)</h1>
-      <a href="?view=display" target="_blank" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-bold">
-        Open Public Display Screen ↗
-      </a>
+      <h1 class="text-3xl font-bold text-amber-400">KJ Control Panel</h1>
+      <div class="flex items-center gap-3">
+        <span id="admin-email" class="text-sm text-slate-400"></span>
+        <button onclick="signOut()" class="px-3 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-sm font-bold">Sign out</button>
+        <a href="?view=display" target="_blank" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-sm font-bold">
+          Open Public Display Screen ↗
+        </a>
+      </div>
     </div>
 
     <div class="bg-slate-900 p-6 rounded-xl border border-slate-800 mb-6">
