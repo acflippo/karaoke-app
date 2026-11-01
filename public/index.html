@@ -546,7 +546,9 @@
     </div>
 
     <!-- Bottom Running Ticker -->
-    <footer class="relative z-10 w-full bg-slate-900 border-t border-slate-800 py-3 px-8 rounded-xl overflow-hidden shadow-inner mt-2">
+    <!-- mb-[48px]: room underneath for Netlify's "Powered by Netlify" badge in the bottom corner
+         (fixed pixels, since the badge doesn't grow with the display's text size) -->
+    <footer class="relative z-10 w-full bg-slate-900 border-t border-slate-800 py-3 px-8 rounded-xl overflow-hidden shadow-inner mt-2 mb-[48px]">
       <div class="w-full overflow-hidden">
         <div id="ticker-content" class="animate-marquee text-5xl leading-tight pb-1 font-semibold text-emerald-400">
           Loading upcoming singers...
