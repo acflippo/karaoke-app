@@ -6,6 +6,7 @@ try { process.loadEnvFile(path.join(__dirname, '.env')); } catch { /* no .env fi
 
 const { readQueue, writeQueue, appendHistory, isAdmin, getQrLinks } = require('./lib/sheets');
 const { verifyGoogleToken, setSessionCookie, clearSessionCookie, requireAdmin, touchSession } = require('./lib/auth');
+const { purgeCache } = require('@netlify/functions');
 
 const app = express();
 const PORT = 3000;
@@ -38,6 +39,35 @@ function onStage(queue) {
 function upNext(queue) {
     const current = onStage(queue);
     return queue.filter(item => item.status === 'Waiting' && item !== current);
+}
+
+// Display screen caching: Netlify's CDN answers the display's polls from its cache, so they don't
+// run this function or read the sheet. Every admin change clears the cached queue, so the display
+// picks it up on its next poll. Locally (node server.js) nothing is cached and these do nothing.
+const QUEUE_CACHE_TAG = 'display-queue';
+const QUEUE_CACHE_SECONDS = 60; // safety net: the display refreshes at least this often even if a clear fails
+const LINKS_CACHE_SECONDS = 5 * 60; // QR links rarely change; sheet edits show up within about 5 minutes
+
+function cacheForDisplay(res, tag, seconds) {
+    res.set({
+        'Cache-Control': 'public, max-age=0, must-revalidate', // browsers always ask the CDN
+        'Netlify-CDN-Cache-Control': `public, durable, s-maxage=${seconds}`,
+        'Netlify-Cache-Tag': tag,
+    });
+}
+
+// Netlify allows 2 clears every 5 seconds, so quick clicks (Up, Up, Up) may need one retry
+async function refreshDisplay(req) {
+    const token = req.lambdaContext?.clientContext?.custom?.purge_api_token;
+    if (!token) return;
+    for (const delayMs of [0, 2500]) {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+        try {
+            return await purgeCache({ tags: [QUEUE_CACHE_TAG], token });
+        } catch (err) {
+            console.error('Clearing the display cache failed:', err.message);
+        }
+    }
 }
 
 const api = express.Router();
@@ -78,15 +108,27 @@ api.post('/auth/activity', requireAdmin, touchSession);
 
 // ---------- QR code links ----------
 
-// GET Venmo and song list links from the sheet (signed-in only, so an unattended screen can't keep calling the server)
-api.get('/links', requireAdmin, async (req, res) => {
-    res.json(await getQrLinks());
+// GET Venmo and song list links from the sheet (public: the display shows them as QR codes).
+// Cached on the CDN for up to LINKS_CACHE_SECONDS.
+api.get('/links', async (req, res) => {
+    const links = await getQrLinks();
+    cacheForDisplay(res, 'display-links', LINKS_CACHE_SECONDS);
+    res.json(links);
 });
 
 // ---------- Queue ----------
 
-// GET current queue (signed-in only: the display screen stops polling once this returns 401)
-api.get('/queue', requireAdmin, async (req, res) => {
+// GET current queue (public: the display screen reads this without signing in).
+// Served from the CDN cache until an admin change clears it (see refreshDisplay).
+api.get('/queue', async (req, res) => {
+    const queue = await readQueue();
+    cacheForDisplay(res, QUEUE_CACHE_TAG, QUEUE_CACHE_SECONDS);
+    res.json(queue);
+});
+
+// GET current queue for the admin console (signed-in only: a 401 here, e.g. after the idle
+// timeout or signing out in another tab, tells the console to stop polling)
+api.get('/admin/queue', requireAdmin, async (req, res) => {
     res.json(await readQueue());
 });
 
@@ -102,6 +144,7 @@ api.post('/queue/add', requireAdmin, async (req, res) => {
     const queue = await readQueue();
     const newQueue = [...queue, { id: Date.now(), singer, song, status: 'Waiting', timestamp: sheetTimestamp() }];
     await writeQueue(newQueue, queue.length);
+    await refreshDisplay(req);
     res.json({ success: true, queue: newQueue });
 });
 
@@ -121,6 +164,7 @@ api.post('/queue/next', requireAdmin, async (req, res) => {
         appendHistory(sheetTimestamp(), orderNumber, current.singer, current.song),
         writeQueue(newQueue, queue.length),
     ]);
+    await refreshDisplay(req);
     res.json({ success: true, queue: newQueue });
 });
 
@@ -155,6 +199,7 @@ api.post('/queue/move', requireAdmin, async (req, res) => {
     });
 
     await writeQueue(newQueue, queue.length);
+    await refreshDisplay(req);
     res.json({ success: true, queue: newQueue });
 });
 
@@ -169,6 +214,7 @@ api.post('/queue/remove', requireAdmin, async (req, res) => {
 
     const newQueue = queue.filter(item => item !== target);
     await writeQueue(newQueue, queue.length);
+    await refreshDisplay(req);
     res.json({ success: true, queue: newQueue });
 });
 

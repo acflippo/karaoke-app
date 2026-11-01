@@ -2,4 +2,7 @@
 const serverless = require('serverless-http');
 const app = require('../../server');
 
-exports.handler = serverless(app);
+exports.handler = serverless(app, {
+    // Netlify's request context carries the token server.js needs to clear the display's CDN cache
+    request: (req, event, context) => { req.lambdaContext = context; },
+});
