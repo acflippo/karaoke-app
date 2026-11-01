@@ -91,13 +91,14 @@
     const isDisplayView = urlParams.get('view') === 'display';
     if (isDisplayView) document.documentElement.classList.add('display-mode');
 
-    // Polling timers: started only after sign-in, all cleared on sign-out so an unattended
-    // screen doesn't keep calling the server (each call is a billed Netlify function run)
+    // Polling timers. The display screen is public and starts right away; the admin console
+    // starts only after sign-in and stops on sign-out (each call is a billed Netlify function run)
     let queueTimer, linksTimer;
 
-    // Lets the console tab tell an open display tab (same browser) that you signed out
+    // Lets one console tab tell other console tabs (same browser) that you signed out.
+    // The public display screen ignores it and keeps running.
     const authChannel = 'BroadcastChannel' in window ? new BroadcastChannel('karaoke-auth') : null;
-    if (authChannel) authChannel.onmessage = (e) => {
+    if (authChannel && !isDisplayView) authChannel.onmessage = (e) => {
       if (e.data === 'signed-out') goToLogin();
       if (e.data === 'signed-out-idle') goToLogin('idle');
     };
@@ -121,15 +122,24 @@
         }, FIREWORKS_PAUSE_MS);
       });
 
-      // Both views are only shown to signed-in, whitelisted Google accounts
-      checkSignIn();
+      if (isDisplayView) {
+        // Display screen: public, anyone with the link can view it
+        document.getElementById('display-panel').classList.remove('hidden');
+        startPolling();
+      } else {
+        // Admin console: only shown to signed-in, whitelisted Google accounts
+        checkSignIn();
+      }
     });
 
     function startPolling() {
+      // How often to check the queue, in milliseconds: display screen every 5 s, admin console every 3 s
+      const QUEUE_POLL_MS = isDisplayView ? 5000 : 3000;
       fetchQueue();
-      queueTimer = setInterval(fetchQueue, 3000);
+      queueTimer = setInterval(fetchQueue, QUEUE_POLL_MS);
       if (isDisplayView) {
-        // Extra large QR Codes; re-check the sheet every minute so link changes show up without a reload
+        // Extra large QR Codes; re-check every minute so link changes show up without a reload
+        // (on Netlify these checks are answered from the CDN cache, which holds the links for 5 minutes)
         loadQrLinks();
         linksTimer = setInterval(loadQrLinks, 60000);
       }
@@ -157,7 +167,7 @@
 
     // Idle sign-out: clicks and typing on the admin console tell the server you're still here
     // (at most once a minute). After an hour without any, the server ends the session and the
-    // next queue poll here and on the display screen gets a 401, which stops all polling.
+    // console's next queue poll gets a 401, which stops its polling.
     const ACTIVITY_REPORT_MS = 60 * 1000;
     let lastActivityReport = 0; // the first click after loading the page always reports
 
@@ -177,13 +187,9 @@
       const res = await fetch('/api/auth/me');
       if (!res.ok) return (await signedOut(res)) || goToLogin();
       const { email } = await res.json();
-      if (isDisplayView) {
-        document.getElementById('display-panel').classList.remove('hidden');
-      } else {
-        document.getElementById('admin-email').textContent = email;
-        document.getElementById('admin-panel').classList.remove('hidden');
-        ['click', 'keydown'].forEach(type => document.addEventListener(type, reportActivity));
-      }
+      document.getElementById('admin-email').textContent = email;
+      document.getElementById('admin-panel').classList.remove('hidden');
+      ['click', 'keydown'].forEach(type => document.addEventListener(type, reportActivity));
       startPolling();
     }
 
@@ -272,8 +278,9 @@
     async function fetchQueue() {
       const startedAt = Date.now();
       try {
-        const res = await fetch('/api/queue');
-        // Signed out (here or in another browser) or session expired: stop polling
+        // Display: public queue. Console: signed-in copy, so a 401 can stop its polling.
+        const res = await fetch(isDisplayView ? '/api/queue' : '/api/admin/queue');
+        // Console signed out (here or in another browser) or session expired: stop polling
         if (await signedOut(res)) return;
         if (!res.ok) return; // server or sheet unreachable: keep what's showing, try again next poll
         const data = await res.json();

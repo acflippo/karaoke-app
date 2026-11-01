@@ -2,8 +2,8 @@
 
 A simple karaoke queue for live band karaoke nights.
 
-- **Display screen**: shows the current singer and song on a big monitor, a scrolling ticker of who's up next, and QR codes for the song list and for tipping the band. It only runs in a browser signed in as an admin, and it stops updating when you click **Sign out**, so an unattended screen doesn't keep calling the server. If nobody clicks or types on the admin console for 1 hour, you're signed out automatically and the display stops too (change `IDLE_MINUTES` in `lib/auth.js`).
-- **Admin console**: add singers and their songs, move singers up or down in the queue, remove singers, and click **Next Singer** to bring the next person on stage. Only approved Google accounts can sign in.
+- **Display screen**: shows the current singer and song on a big monitor, a scrolling ticker of who's up next, and QR codes for the song list and for tipping the band. Anyone with the link can view it, no sign-in needed. It updates within a few seconds whenever someone adds, removes or moves a singer, or clicks **Next Singer**. On Netlify, the display's checks are answered from Netlify's cache, so the app itself only runs when the queue changes (plus about once a minute as a safety net).
+- **Admin console**: add singers and their songs, move singers up or down in the queue, remove singers, and click **Next Singer** to bring the next person on stage. Only approved Google accounts can sign in. If nobody clicks or types on the console for 1 hour, you're signed out automatically and it stops checking for updates (change `IDLE_MINUTES` in `lib/auth.js`).
 
 The queue and the history of completed performances are saved in a Google Sheet with three tabs:
 
@@ -15,7 +15,7 @@ The queue and the history of completed performances are saved in a Google Sheet 
 | `venmo_url` | Link for the Venmo QR code. Column A is a label, column B the link: the `primary` row is used if it has a link, otherwise the `default if primary is not set` row |
 | `song_list_url` | Link for the song list QR code (the first link in the tab, e.g. cell A1) |
 
-To change the QR codes for an event, edit the links in `venmo_url` or `song_list_url`; the display picks up the change within about a minute, no reload needed.
+To change the QR codes for an event, edit the links in `venmo_url` or `song_list_url`; the display picks up the change within about 5 minutes, no reload needed.
 
 To give someone access, add their Gmail address to the `admins` tab. To remove access, delete their row (takes effect within a minute).
 
